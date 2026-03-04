@@ -1,0 +1,5 @@
+anthropic
+pydantic
+pandas
+tqdm
+python-dotenv
