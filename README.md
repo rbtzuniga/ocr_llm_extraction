@@ -67,6 +67,14 @@ python extract_elevators.py extract inputs/2013.csv outputs/2013.jsonl
 python extract_elevators.py tocsv outputs/2013.jsonl
 ```
 
+### Jupyter Notebook
+
+Open **[example.ipynb](example.ipynb)** for an interactive walkthrough. The notebook lets you:
+
+1. Configure paths and select which pipeline steps to run (OCR, Extraction, CSV)
+2. Execute the pipeline
+3. Inspect results in a DataFrame
+
 ## Output files
 
 For a run with `--year 2013`, the `outputs/` folder will contain:
@@ -84,6 +92,7 @@ For a run with `--year 2013`, the `outputs/` folder will contain:
 run_pipeline.py          # Main entry point — orchestrates all steps
 extract_elevators.py     # Claude extraction + Pydantic validation
 scan_tools.py            # Google Document AI OCR + image preprocessing
+example.ipynb            # Interactive notebook example
 requirements.txt
 .env.example             # Template for API keys
 ```
