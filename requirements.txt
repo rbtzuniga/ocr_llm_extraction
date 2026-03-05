@@ -3,3 +3,8 @@ pydantic
 pandas
 tqdm
 python-dotenv
+google-cloud-documentai
+PyPDF2
+opencv-python
+numpy
+matplotlib

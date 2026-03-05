@@ -5,3 +5,4 @@ outputs/
 extraction.log
 __pycache__/
 *.pyc
+keys/

@@ -10,6 +10,7 @@ Requirements:
 """
 
 import json
+import re
 import time
 import logging
 import argparse
@@ -175,9 +176,12 @@ def preprocess_entries(
     """
     rows = []
     for _, r in ok.iterrows():
+        # Strip leading non-letter chars (spaces, newlines, hyphens, etc.)
+        # so OCR artifacts don't cause a valid entry to look like a continuation.
+        cleaned_text = re.sub(r'^[^a-zA-Z]+', '', r["text"].strip())
         rows.append({
             "img_name": r["img_name"].strip(),
-            "text": r["text"].strip(),
+            "text": cleaned_text,
         })
 
     # Sort by parsed (year, page, entry) so ordering is reliable
@@ -414,9 +418,11 @@ def process_csv(input_path: str, output_path: str, model: str = "claude-sonnet-4
             try:
                 raw_dict = call_claude(client, img_name, text, model=model)
 
-                # Validate with Pydantic
-                entry = ElevatorEntry.model_validate(raw_dict)
-                out_f.write(entry.model_dump_json() + "\n")
+                # Claude may return a list when the text contains multiple entries
+                items = raw_dict if isinstance(raw_dict, list) else [raw_dict]
+                for item in items:
+                    entry = ElevatorEntry.model_validate(item)
+                    out_f.write(entry.model_dump_json() + "\n")
                 out_f.flush()
                 processed.add(img_name)
 
