@@ -1,6 +1,6 @@
 # Grain Elevator Directory Extractor
 
-Extracts structured data from scanned grain elevator directory pages using **Google Document AI** (OCR) and **Claude** (structured extraction).
+Extracts structured data from scanned grain elevator directory pages using **Google Document AI** (OCR) and **Claude** (or another LLM) for structured extraction.
 
 ## Pipeline
 
@@ -22,7 +22,7 @@ pip install -r requirements.txt
    ```bash
    cp .env.example .env
    ```
-2. **Anthropic** — set `ANTHROPIC_API_KEY` in `.env`.
+2. **Anthropic** — set `ANTHROPIC_API_KEY` in `.env`. (To use a different LLM, see [Using a different LLM](#using-a-different-llm-eg-openai-codex) below.)
 3. **Google Cloud Document AI** — set the `GCP_*` variables in `.env` and place your service-account JSON file in the `keys/` folder. The credential file is auto-detected from `keys/*.json`.
 
 > Both `.env` and `keys/` are git-ignored and will not be committed.
@@ -96,3 +96,46 @@ example.ipynb            # Interactive notebook example
 requirements.txt
 .env.example             # Template for API keys
 ```
+
+## Using a different LLM (e.g., OpenAI Codex)
+
+The extraction step uses Claude by default, but you can swap in another LLM provider by modifying `extract_elevators.py`:
+
+1. **Install the provider's SDK**:
+   ```bash
+   pip install openai
+   ```
+
+2. **Set the API key** in `.env`:
+   ```
+   OPENAI_API_KEY=sk-...
+   ```
+
+3. **Update the client initialization** in `extract_elevators.py`:
+   ```python
+   # Replace:
+   import anthropic
+   client = anthropic.Anthropic()
+
+   # With:
+   from openai import OpenAI
+   client = OpenAI()
+   ```
+
+4. **Update the API call** in `call_llm_with_retry()`:
+   ```python
+   # Replace the Claude messages.create() call with:
+   response = client.chat.completions.create(
+       model="gpt-4o",  # or "codex", "gpt-4-turbo", etc.
+       messages=[
+           {"role": "system", "content": SYSTEM_PROMPT},
+           {"role": "user", "content": user_message},
+       ],
+       max_tokens=4096,
+   )
+   raw = response.choices[0].message.content
+   ```
+
+5. **Update exception handling** to catch `openai.APIError` instead of `anthropic.APIError`.
+
+> The prompt and JSON schema remain the same — only the client and API call format change.
