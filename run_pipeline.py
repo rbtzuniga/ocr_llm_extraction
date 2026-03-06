@@ -114,11 +114,11 @@ def _save_ocr_csv(path, img_names, texts, statuses, errors):
 # Step 2 — Extraction  (Claude)
 # ---------------------------------------------------------------------------
 
-def run_extraction(ocr_csv_path: Path, jsonl_path: Path, model: str) -> None:
-    """Extract structured elevator entries from OCR CSV using Claude."""
+def run_extraction(ocr_csv_path: Path, jsonl_path: Path, model: str, backend: str) -> None:
+    """Extract structured elevator entries from OCR CSV using Claude or Ollama."""
     from extract_elevators import process_csv
-    log.info("Extraction: %s → %s", ocr_csv_path, jsonl_path)
-    process_csv(str(ocr_csv_path), str(jsonl_path), model=model)
+    log.info("Extraction: %s → %s (backend=%s)", ocr_csv_path, jsonl_path, backend)
+    process_csv(str(ocr_csv_path), str(jsonl_path), model=model, backend=backend)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +145,7 @@ def run_pipeline(
     do_extraction: bool = True,
     do_csv: bool = True,
     model: str = "claude-sonnet-4-6",
+    backend: str = "claude",
 ) -> None:
     """Run the full or partial pipeline.
 
@@ -163,7 +164,9 @@ def run_pipeline(
     do_csv : bool
         Step 3 — Convert extraction JSONL to a flat CSV.
     model : str
-        Claude model to use for extraction.
+        Model to use for extraction (e.g., "claude-sonnet-4-6" or "llama3.1:8b").
+    backend : str
+        Backend to use: "claude" or "ollama".
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -185,7 +188,7 @@ def run_pipeline(
             raise FileNotFoundError(
                 f"OCR CSV not found: {ocr_csv}  — run with do_ocr=True first"
             )
-        run_extraction(ocr_csv, jsonl, model=model)
+        run_extraction(ocr_csv, jsonl, model=model, backend=backend)
 
     if do_csv:
         if not jsonl.exists():
