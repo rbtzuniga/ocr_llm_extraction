@@ -1,6 +1,6 @@
 # Grain Elevator Directory Extractor
 
-Extracts structured data from scanned grain elevator directory pages using **Google Document AI** (OCR) and **Claude** (or another LLM) for structured extraction.
+Extracts structured data from scanned grain elevator directory pages using **Google Document AI** (OCR) and **Claude** or **Ollama** (local LLM) for structured extraction.
 
 ## Pipeline
 
@@ -60,8 +60,15 @@ run_pipeline(
 ### Standalone subcommands (extract_elevators.py)
 
 ```bash
-# Extract from an existing OCR CSV
+# Extract using Claude API (default)
 python extract_elevators.py extract inputs/2013.csv outputs/2013.jsonl
+
+# Extract using local Ollama (free, no API costs)
+python extract_elevators.py extract inputs/2013.csv outputs/2013.jsonl --backend ollama
+
+# Use a specific model
+python extract_elevators.py extract inputs/2013.csv outputs/2013.jsonl --backend ollama --model mistral:7b
+python extract_elevators.py extract inputs/2013.csv outputs/2013.jsonl --backend claude --model claude-3-5-haiku-latest
 
 # Convert JSONL to CSV
 python extract_elevators.py tocsv outputs/2013.jsonl
@@ -139,3 +146,62 @@ The extraction step uses Claude by default, but you can swap in another LLM prov
 5. **Update exception handling** to catch `openai.APIError` instead of `anthropic.APIError`.
 
 > The prompt and JSON schema remain the same — only the client and API call format change.
+
+## Using Ollama (Local LLM — Free)
+
+Ollama lets you run LLMs locally on your machine, eliminating API costs. This is ideal for batch processing when you have a decent GPU.
+
+### Requirements
+
+- **GPU recommended**: NVIDIA GPU with 8GB+ VRAM for good performance
+- **CPU fallback**: Works but much slower (30-90 sec per extraction vs 5-15 sec with GPU)
+
+### Installation
+
+1. **Download and install Ollama** from https://ollama.com/download
+
+2. **Pull a model** (run in terminal):
+   ```bash
+   ollama pull llama3.1:8b
+   ```
+
+3. **Verify it's running**:
+   ```bash
+   ollama list
+   ```
+
+### Recommended Models
+
+| Model | VRAM | Speed | Quality | Command |
+|-------|------|-------|---------|--------|
+| `llama3.1:8b` | ~5GB | Fast | Good | `ollama pull llama3.1:8b` |
+| `mistral:7b` | ~4GB | Fastest | Good | `ollama pull mistral:7b` |
+| `qwen2.5:7b` | ~4GB | Fast | Good for JSON | `ollama pull qwen2.5:7b` |
+| `llama3.1:70b` | ~40GB | Slow | Excellent | Requires high-end GPU |
+
+For most use cases, `llama3.1:8b` (default) or `mistral:7b` provide the best balance.
+
+### Usage
+
+```bash
+# Uses llama3.1:8b by default
+python extract_elevators.py extract inputs/2013.csv outputs/2013.jsonl --backend ollama
+
+# Specify a different model
+python extract_elevators.py extract inputs/2013.csv outputs/2013.jsonl --backend ollama --model mistral:7b
+```
+
+### Performance Comparison
+
+| Backend | Speed per entry | Cost (1000 entries) |
+|---------|-----------------|---------------------|
+| Claude Sonnet (API) | ~2-5 sec | ~$30-50 |
+| Claude Haiku (API) | ~1-3 sec | ~$3-5 |
+| Ollama (GPU) | ~5-15 sec | Free |
+| Ollama (CPU) | ~30-90 sec | Free |
+
+### Troubleshooting
+
+- **"Cannot connect to Ollama"**: Make sure Ollama is running (`ollama serve` or check system tray)
+- **Model not found**: Run `ollama pull <model-name>` first
+- **Slow performance**: Ensure your NVIDIA GPU is being used (check with `nvidia-smi`)

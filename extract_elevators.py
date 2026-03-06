@@ -18,12 +18,17 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import requests
 from tqdm import tqdm
 from pydantic import BaseModel, Field, ValidationError
 import anthropic
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# Ollama configuration
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_DEFAULT_MODEL = "llama3.1:8b"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -300,7 +305,68 @@ def make_user_prompt(img_name: str, text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# API call with retry
+# Ollama API call
+# ---------------------------------------------------------------------------
+
+def call_ollama(
+    img_name: str,
+    text: str,
+    model: str = OLLAMA_DEFAULT_MODEL,
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+) -> dict:
+    """Call Ollama local LLM and return parsed dict, or raise on persistent failure."""
+    sanitized = False
+    for attempt in range(1, max_retries + 1):
+        try:
+            prompt_text = sanitize_text(text) if sanitized else text
+            full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {make_user_prompt(img_name, prompt_text)}\n\nRespond with ONLY valid JSON:"
+            
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": full_prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 2048,
+                    },
+                },
+                timeout=120,  # 2 minute timeout for slow generations
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            raw = result.get("response", "").strip()
+            
+            if not raw:
+                raise RuntimeError("Empty response from Ollama")
+            
+            # Strip accidental markdown fences
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            # Also handle trailing fences
+            if "```" in raw:
+                raw = raw.split("```")[0]
+            
+            return json.loads(raw.strip())
+            
+        except (json.JSONDecodeError, requests.RequestException, RuntimeError) as exc:
+            log.warning("Attempt %d/%d failed for %s: %s", attempt, max_retries, img_name, exc)
+            if not sanitized:
+                log.info("Switching to sanitized (ASCII-only) text for %s", img_name)
+                sanitized = True
+            if attempt < max_retries:
+                time.sleep(retry_delay * attempt)
+            else:
+                raise
+
+
+# ---------------------------------------------------------------------------
+# Claude API call with retry
 # ---------------------------------------------------------------------------
 
 def call_claude(
@@ -358,7 +424,12 @@ def call_claude(
 # Main processing loop
 # ---------------------------------------------------------------------------
 
-def process_csv(input_path: str, output_path: str, model: str = "claude-sonnet-4-6") -> None:
+def process_csv(
+    input_path: str,
+    output_path: str,
+    model: str = "claude-sonnet-4-6",
+    backend: str = "claude",
+) -> None:
     input_path = Path(input_path)
     output_path = Path(output_path)
     error_path = output_path.with_suffix(".errors.jsonl")
@@ -368,6 +439,7 @@ def process_csv(input_path: str, output_path: str, model: str = "claude-sonnet-4
     # Filter to successful OCR rows only
     ok = df[df["status"].str.strip().str.lower() == "success"].copy()
     log.info("Total rows: %d  |  status=success: %d", len(df), len(ok))
+    log.info("Using backend: %s  |  model: %s", backend, model)
 
     # Determine already-processed img_names to allow resuming
     processed: set[str] = set()
@@ -397,7 +469,24 @@ def process_csv(input_path: str, output_path: str, model: str = "claude-sonnet-4
         len(flagged_errors),
     )
 
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+    # Initialize client based on backend
+    client = None
+    if backend == "claude":
+        client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+    elif backend == "ollama":
+        # Verify Ollama is running
+        try:
+            r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+            r.raise_for_status()
+            available_models = [m["name"] for m in r.json().get("models", [])]
+            if model not in available_models and not any(model in m for m in available_models):
+                log.warning("Model '%s' not found. Available: %s", model, available_models)
+                log.info("Run: ollama pull %s", model)
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
+                f"Make sure Ollama is running: ollama serve"
+            ) from e
 
     with open(output_path, "a", encoding="utf-8") as out_f, open(error_path, "a", encoding="utf-8") as err_f:
         # Write out pre-processing errors first
@@ -416,9 +505,12 @@ def process_csv(input_path: str, output_path: str, model: str = "claude-sonnet-4
                 continue
 
             try:
-                raw_dict = call_claude(client, img_name, text, model=model)
+                if backend == "claude":
+                    raw_dict = call_claude(client, img_name, text, model=model)
+                else:  # ollama
+                    raw_dict = call_ollama(img_name, text, model=model)
 
-                # Claude may return a list when the text contains multiple entries
+                # LLM may return a list when the text contains multiple entries
                 items = raw_dict if isinstance(raw_dict, list) else [raw_dict]
                 for item in items:
                     entry = ElevatorEntry.model_validate(item)
@@ -552,13 +644,19 @@ if __name__ == "__main__":
     sub = parser.add_subparsers(dest="command")
 
     # --- extract subcommand (default behaviour) ---
-    p_extract = sub.add_parser("extract", help="Extract elevator data from CSV via Claude API.")
+    p_extract = sub.add_parser("extract", help="Extract elevator data from CSV via LLM.")
     p_extract.add_argument("input_csv", help="Path to input CSV file")
     p_extract.add_argument("output_jsonl", help="Path to output JSONL file")
     p_extract.add_argument(
+        "--backend",
+        choices=["claude", "ollama"],
+        default="claude",
+        help="LLM backend: 'claude' (API) or 'ollama' (local). Default: claude",
+    )
+    p_extract.add_argument(
         "--model",
-        default="claude-sonnet-4-6",
-        help="Claude model string (default: claude-sonnet-4-6)",
+        default=None,
+        help="Model name. Defaults: claude-sonnet-4-6 (claude), llama3.1:8b (ollama)",
     )
 
     # --- tocsv subcommand ---
@@ -573,7 +671,11 @@ if __name__ == "__main__":
         csv_out = args.output_csv or str(Path(args.input_jsonl).with_suffix(".csv"))
         jsonl_to_csv(args.input_jsonl, csv_out)
     elif args.command == "extract":
-        process_csv(args.input_csv, args.output_jsonl, model=args.model)
+        # Set default model based on backend if not specified
+        model = args.model
+        if model is None:
+            model = OLLAMA_DEFAULT_MODEL if args.backend == "ollama" else "claude-sonnet-4-6"
+        process_csv(args.input_csv, args.output_jsonl, model=model, backend=args.backend)
     else:
         # Backwards-compatible: no subcommand → treat positional args as extract
         parser.print_help()
