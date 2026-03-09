@@ -517,37 +517,35 @@ def create_batch_requests(
     model: str,
     include_text: bool = False,
 ) -> list[dict]:
-    """Create a list of batch request objects for the Anthropic Batches API."""
-    extraction_schema = get_extraction_schema(include_text=include_text)
+    """Create a list of batch request objects for the Anthropic Batches API.
+    
+    Note: Batch API uses schema-in-prompt approach since response_format 
+    with JSON schema is not fully supported in batches.
+    """
     requests = []
     
     for entry in entries:
         img_name = entry["img_name"]
         text = sanitize_text(entry["text"])
         
+        # Sanitize custom_id: must match ^[a-zA-Z0-9_-]{1,64}$
+        # Replace + with __ (for merged entries), remove file extensions
+        custom_id = img_name.replace("+", "__").replace(".png", "").replace(".jpg", "").replace(".jpeg", "")
+        # Replace any remaining invalid chars with _
+        custom_id = re.sub(r'[^a-zA-Z0-9_-]', '_', custom_id)
+        # Truncate to 64 chars max
+        custom_id = custom_id[:64]
+        
+        # Use schema-in-prompt for batch mode (more compatible)
         request = {
-            "custom_id": img_name,
+            "custom_id": custom_id,
             "params": {
                 "model": model,
                 "max_tokens": 2048,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"}
-                    }
-                ],
+                "system": SYSTEM_PROMPT_WITH_SCHEMA,
                 "messages": [
                     {"role": "user", "content": make_user_prompt(img_name, text)}
                 ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "elevator_entry",
-                        "strict": True,
-                        "schema": extraction_schema,
-                    }
-                }
             }
         }
         requests.append(request)
@@ -573,18 +571,15 @@ def process_batch(
     
     requests = create_batch_requests(entries, model, include_text)
     
-    # Create the batch
-    batch = client.beta.messages.batches.create(
-        betas=["prompt-caching-2024-07-31"],
-        requests=requests
-    )
+    # Create the batch using the messages.batches API
+    batch = client.messages.batches.create(requests=requests)
     
     batch_id = batch.id
     log.info("Batch created: %s — polling for completion...", batch_id)
     
     # Poll for completion
     while True:
-        batch_status = client.beta.messages.batches.retrieve(batch_id)
+        batch_status = client.messages.batches.retrieve(batch_id)
         status = batch_status.processing_status
         
         if status == "ended":
@@ -592,11 +587,12 @@ def process_batch(
         elif status in ("canceling", "canceled"):
             raise RuntimeError(f"Batch {batch_id} was canceled")
         
+        counts = batch_status.request_counts
+        completed = counts.succeeded + counts.errored + counts.canceled + counts.expired
+        total = counts.processing + completed
         log.info(
             "Batch %s: %s (requests: %d/%d completed)",
-            batch_id, status,
-            batch_status.request_counts.succeeded + batch_status.request_counts.errored,
-            batch_status.request_counts.total,
+            batch_id, status, completed, total,
         )
         time.sleep(poll_interval)
     
@@ -605,8 +601,18 @@ def process_batch(
     results = {}
     errors = {}
     
-    for result in client.beta.messages.batches.results(batch_id):
+    # Build reverse mapping: custom_id -> original img_name
+    custom_id_to_img = {}
+    for entry in entries:
+        img_name = entry["img_name"]
+        custom_id = img_name.replace("+", "__").replace(".png", "").replace(".jpg", "").replace(".jpeg", "")
+        custom_id = re.sub(r'[^a-zA-Z0-9_-]', '_', custom_id)[:64]
+        custom_id_to_img[custom_id] = img_name
+    
+    for result in client.messages.batches.results(batch_id):
         custom_id = result.custom_id
+        # Map back to original img_name
+        img_name = custom_id_to_img.get(custom_id, custom_id)
         
         if result.result.type == "succeeded":
             message = result.result.message
@@ -618,18 +624,182 @@ def process_batch(
                         raw = raw.split("```")[1]
                         if raw.startswith("json"):
                             raw = raw[4:]
-                    results[custom_id] = json.loads(raw)
+                    results[img_name] = json.loads(raw)
                 except json.JSONDecodeError as e:
-                    errors[custom_id] = f"JSON decode error: {e}"
+                    errors[img_name] = f"JSON decode error: {e}"
             else:
-                errors[custom_id] = "Empty response content"
+                errors[img_name] = "Empty response content"
         else:
             error_type = result.result.type
             error_msg = getattr(result.result, 'error', {})
-            errors[custom_id] = f"{error_type}: {error_msg}"
+            errors[img_name] = f"{error_type}: {error_msg}"
     
     log.info("Batch results: %d succeeded, %d failed", len(results), len(errors))
     return results, errors
+
+
+def submit_batch(
+    ocr_csv_path: str,
+    model: str = "claude-sonnet-4-6",
+) -> str:
+    """Submit a batch for processing and return the batch ID immediately.
+    
+    Use this to submit a batch without waiting for completion.
+    Later, use recover_batch() to retrieve results.
+    
+    Args:
+        ocr_csv_path: Path to OCR CSV file
+        model: Claude model to use
+        
+    Returns:
+        Batch ID string (e.g., "msgbatch_xxx")
+    
+    Example:
+        batch_id = submit_batch("inputs/2013_ocr.csv")
+        print(f"Submitted batch: {batch_id}")
+        # ... later ...
+        recover_batch(batch_id, "outputs/2013.jsonl")
+    """
+    import pandas as pd
+    
+    df = pd.read_csv(ocr_csv_path, dtype=str).fillna("")
+    ok = df[df["status"].str.strip().str.lower() == "success"].copy()
+    
+    entries_to_process, flagged_errors = preprocess_entries(ok)
+    log.info("Prepared %d entries for batch submission", len(entries_to_process))
+    
+    if flagged_errors:
+        log.warning("%d entries flagged as errors (no elevator type)", len(flagged_errors))
+    
+    client = anthropic.Anthropic()
+    requests = create_batch_requests(entries_to_process, model, include_text=False)
+    
+    log.info("Submitting batch with %d requests...", len(requests))
+    batch = client.messages.batches.create(requests=requests)
+    
+    log.info("Batch submitted: %s", batch.id)
+    log.info("Check status: client.messages.batches.retrieve('%s')", batch.id)
+    
+    return batch.id
+
+
+def recover_batch(
+    batch_id: str,
+    output_jsonl_path: str,
+    include_text: bool = False,
+) -> tuple[int, int]:
+    """Recover results from a completed batch and write to JSONL.
+    
+    Use this to retrieve results from a batch that was submitted earlier.
+    
+    Args:
+        batch_id: Batch ID from submit_batch()
+        output_jsonl_path: Path to write output JSONL
+        include_text: Whether to include original text in output
+        
+    Returns:
+        Tuple of (success_count, error_count)
+    
+    Example:
+        successes, errors = recover_batch("msgbatch_xxx", "outputs/2013.jsonl")
+        print(f"Recovered {successes} entries, {errors} errors")
+    """
+    client = anthropic.Anthropic()
+    
+    # Check batch status
+    batch_status = client.messages.batches.retrieve(batch_id)
+    if batch_status.processing_status != "ended":
+        raise RuntimeError(
+            f"Batch {batch_id} is not complete. Status: {batch_status.processing_status}"
+        )
+    
+    output_path = Path(output_jsonl_path)
+    error_path = output_path.with_suffix(".errors.jsonl")
+    
+    success_count = 0
+    error_count = 0
+    
+    log.info("Retrieving results from batch %s...", batch_id)
+    
+    with open(output_path, "a", encoding="utf-8") as out_f, \
+         open(error_path, "a", encoding="utf-8") as err_f:
+        
+        for result in client.messages.batches.results(batch_id):
+            custom_id = result.custom_id
+            # Reverse the custom_id sanitization: __ back to +, and add .png
+            img_name = custom_id.replace("__", "+") + ".png"
+            
+            if result.result.type == "succeeded":
+                message = result.result.message
+                if message.content and message.content[0].text:
+                    try:
+                        raw = message.content[0].text.strip()
+                        # Strip markdown fences if present
+                        if raw.startswith("```"):
+                            raw = raw.split("```")[1]
+                            if raw.startswith("json"):
+                                raw = raw[4:]
+                        data = json.loads(raw)
+                        
+                        # Validate and write
+                        items = data if isinstance(data, list) else [data]
+                        for item in items:
+                            entry = ElevatorEntry.model_validate(item)
+                            out_f.write(entry.model_dump_json() + "\n")
+                            success_count += 1
+                    except (json.JSONDecodeError, ValidationError) as e:
+                        log.error("Parse error for %s: %s", img_name, e)
+                        err_f.write(json.dumps({
+                            "img_name": img_name,
+                            "error": "parse_error",
+                            "detail": str(e),
+                        }) + "\n")
+                        error_count += 1
+                else:
+                    err_f.write(json.dumps({
+                        "img_name": img_name,
+                        "error": "empty_response",
+                    }) + "\n")
+                    error_count += 1
+            else:
+                error_type = result.result.type
+                error_msg = getattr(result.result, 'error', {})
+                err_f.write(json.dumps({
+                    "img_name": img_name,
+                    "error": error_type,
+                    "detail": str(error_msg),
+                }) + "\n")
+                error_count += 1
+    
+    log.info("Recovered %d entries, %d errors", success_count, error_count)
+    log.info("Output: %s", output_path)
+    if error_count > 0:
+        log.info("Errors: %s", error_path)
+    
+    return success_count, error_count
+
+
+def list_batches(limit: int = 10) -> list[dict]:
+    """List recent batches and their status.
+    
+    Returns:
+        List of batch info dicts with id, status, created_at, and counts
+    """
+    client = anthropic.Anthropic()
+    batches = []
+    
+    for batch in client.messages.batches.list(limit=limit):
+        counts = batch.request_counts
+        batches.append({
+            "id": batch.id,
+            "status": batch.processing_status,
+            "created_at": str(batch.created_at),
+            "succeeded": counts.succeeded,
+            "errored": counts.errored,
+            "processing": counts.processing,
+        })
+    
+    return batches
 
 
 # ---------------------------------------------------------------------------
