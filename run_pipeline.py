@@ -114,11 +114,25 @@ def _save_ocr_csv(path, img_names, texts, statuses, errors):
 # Step 2 — Extraction  (Claude)
 # ---------------------------------------------------------------------------
 
-def run_extraction(ocr_csv_path: Path, jsonl_path: Path, model: str, backend: str) -> None:
+def run_extraction(
+    ocr_csv_path: Path,
+    jsonl_path: Path,
+    model: str,
+    backend: str,
+    batching: bool = False,
+    include_text: bool = False,
+) -> None:
     """Extract structured elevator entries from OCR CSV using Claude or Ollama."""
     from extract_elevators import process_csv
-    log.info("Extraction: %s → %s (backend=%s)", ocr_csv_path, jsonl_path, backend)
-    process_csv(str(ocr_csv_path), str(jsonl_path), model=model, backend=backend)
+    log.info("Extraction: %s → %s (backend=%s, batching=%s)", ocr_csv_path, jsonl_path, backend, batching)
+    process_csv(
+        str(ocr_csv_path),
+        str(jsonl_path),
+        model=model,
+        backend=backend,
+        batching=batching,
+        include_text=include_text,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +160,8 @@ def run_pipeline(
     do_csv: bool = True,
     model: str = "claude-sonnet-4-6",
     backend: str = "claude",
+    batching: bool = False,
+    include_text: bool = False,
 ) -> None:
     """Run the full or partial pipeline.
 
@@ -167,6 +183,10 @@ def run_pipeline(
         Model to use for extraction (e.g., "claude-sonnet-4-6" or "llama3.1:8b").
     backend : str
         Backend to use: "claude" or "ollama".
+    batching : bool
+        Use Anthropic Message Batches API for 50% cost savings (Claude only).
+    include_text : bool
+        Include original OCR text in output JSON (increases token costs).
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -188,7 +208,13 @@ def run_pipeline(
             raise FileNotFoundError(
                 f"OCR CSV not found: {ocr_csv}  — run with do_ocr=True first"
             )
-        run_extraction(ocr_csv, jsonl, model=model, backend=backend)
+        run_extraction(
+            ocr_csv, jsonl,
+            model=model,
+            backend=backend,
+            batching=batching,
+            include_text=include_text,
+        )
 
     if do_csv:
         if not jsonl.exists():
@@ -215,6 +241,22 @@ def main():
     p.add_argument("--do-extraction", action="store_true", help="Run Claude extraction step")
     p.add_argument("--do-csv", action="store_true", help="Run JSONL→CSV conversion step")
     p.add_argument("--model", default="claude-sonnet-4-6", help="Claude model for extraction")
+    p.add_argument(
+        "--backend",
+        choices=["claude", "ollama"],
+        default="claude",
+        help="LLM backend: 'claude' (API) or 'ollama' (local). Default: claude",
+    )
+    p.add_argument(
+        "--batching",
+        action="store_true",
+        help="Use Anthropic Message Batches API for 50%% cost savings (Claude only).",
+    )
+    p.add_argument(
+        "--include-text",
+        action="store_true",
+        help="Include original OCR text in output JSON (increases token costs).",
+    )
     args = p.parse_args()
 
     # If no step flags are given, run all steps
@@ -231,6 +273,9 @@ def main():
         do_extraction=args.do_extraction,
         do_csv=args.do_csv,
         model=args.model,
+        backend=args.backend,
+        batching=args.batching,
+        include_text=args.include_text,
     )
 
 
